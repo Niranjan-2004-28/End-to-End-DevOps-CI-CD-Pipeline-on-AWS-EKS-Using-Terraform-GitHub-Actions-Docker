@@ -1,0 +1,92 @@
+name: CI-CD
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "app/**"
+      - "k8s/**"
+      - ".github/workflows/ci-cd.yml"
+
+permissions:
+  contents: write
+  id-token: write
+
+env:
+  AWS_REGION: ap-south-1
+  EKS_CLUSTER_NAME: niranjan-eks
+  IMAGE_NAME: ${{ secrets.DOCKERHUB_USERNAME }}/niranjan-devops-app
+  MANIFEST_FILE: k8s/deployment.yaml
+
+jobs:
+  build-push-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set image tag
+        id: meta
+        run: echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"
+
+      - name: Configure AWS credentials with GitHub OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_GITHUB_ACTIONS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Verify AWS identity
+        run: aws sts get-caller-identity
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build Docker image
+        run: |
+          docker build -t "${IMAGE_NAME}:${{ steps.meta.outputs.tag }}" ./app
+          docker tag "${IMAGE_NAME}:${{ steps.meta.outputs.tag }}" "${IMAGE_NAME}:latest"
+
+      - name: Push Docker image
+        run: |
+          docker push "${IMAGE_NAME}:${{ steps.meta.outputs.tag }}"
+          docker push "${IMAGE_NAME}:latest"
+
+      - name: Update Kubernetes image tag
+        run: |
+          sed -i "s#image: .*#image: ${IMAGE_NAME}:${GITHUB_SHA}#" "${MANIFEST_FILE}"
+
+      - name: Commit Kubernetes manifest change
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "${MANIFEST_FILE}"
+          git diff --cached --quiet && exit 0
+          git commit -m "chore: deploy ${GITHUB_SHA}"
+          git push
+
+      - name: Connect kubectl to EKS
+        run: |
+          aws eks update-kubeconfig \
+            --region "${AWS_REGION}" \
+            --name "${EKS_CLUSTER_NAME}"
+
+      - name: Deploy Kubernetes manifests
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/deployment.yaml
+          kubectl apply -f k8s/service.yaml
+          kubectl apply -f k8s/ingress.yaml
+
+      - name: Wait for rollout
+        run: |
+          kubectl rollout status deployment/devops-app \
+            -n devops \
+            --timeout=5m
+
+      - name: Show deployment status
+        run: |
+          kubectl get deployment,pods,svc,ingress -n devops
